@@ -1,0 +1,114 @@
+WITH BaseEWM AS(
+    SELECT
+        REGEXP_REPLACE(unidade_transporte, r'\.0$', '') AS TU,
+        documento AS Remessa,
+        dt_criacao AS DataCriacao,
+        tp_doc AS TipoRemessa,
+        transportadora AS Transp,
+        recebedor AS Recebedor
+    FROM `sandbox-operacoes-logistica.logistica.ucs_tus_cd_cgs`
+    GROUP BY ALL
+),
+
+calaminho AS(
+    SELECT remessa_calaminho FROM `sandbox-operacoes-logistica.logistica.remessas_varejo_rs`
+),
+
+Tarefas AS (
+    SELECT
+        CAST(CAST(cod_documento_remessa AS INT64) AS STRING) AS Remessa,
+        COUNT(DISTINCT CAST(cod_unidade_tratamento_destino AS INT64)) AS Qtd_Volumes,
+        CAST(cod_unidade_tratamento_destino AS INT64) AS UC,
+        MAX(CASE
+            WHEN STARTS_WITH(CAST(CAST(cod_unidade_tratamento_destino AS INT64) AS STRING), '101') THEN 'P'
+            WHEN STARTS_WITH(CAST(CAST(cod_unidade_tratamento_destino AS INT64) AS STRING), '201') THEN 'M'
+            WHEN STARTS_WITH(CAST(CAST(cod_unidade_tratamento_destino AS INT64) AS STRING), '301') THEN 'G'
+            WHEN STARTS_WITH(CAST(CAST(cod_unidade_tratamento_destino AS INT64) AS STRING), '401') THEN 'GV'
+            WHEN STARTS_WITH(CAST(CAST(cod_unidade_tratamento_destino AS INT64) AS STRING), '701') THEN 'CFP'
+            ELSE null
+        END) AS Tp_CX_Predominante,
+
+        MIN(dt_hr_confirmacao_fuso_deposito) AS Min_Dt_Confirmacao,
+        MAX(dt_hr_confirmacao_fuso_deposito) AS Max_Dt_Confirmacao
+
+    FROM `trusted-zone.armazenamento.tb_tarefa_armazem` 
+    WHERE cod_deposito = 'E001'
+    AND dt_hr_criacao_fuso_deposito > '2025-10-01 00:00:00'
+    AND cod_documento_remessa IS NOT NULL
+    AND cod_unidade_tratamento_destino IS NOT NULL
+    GROUP BY 1, 3
+),
+
+Material AS (
+    SELECT
+        cod_material,
+        des_material,
+        cod_marca_mae,
+        qt_altura_material*qt_largura_material*qt_comprimento_material AS VolCubMat,
+        qt_peso_bruto
+    FROM `trusted-zone.material.tb_material` 
+    GROUP BY ALL
+),
+
+Peds AS(
+    SELECT
+        CAST(CAST(cod_fornecimento AS INT64) AS STRING) AS Remessa,
+        dt_faturamento,
+        cod_item_remessa,
+        des_unidade_volume,
+        LPAD(SAFE_CAST(SAFE_CAST(cod_material AS INT64) AS STRING),5,'0') AS Material,
+        des_material,
+        grp_material,
+        cod_itinerario,
+        cod_numero_documento_referencia,
+        SUM(qt_original_remessa) AS Qtd
+    FROM `trusted-zone.armazenamento.tb_documento_remessa_entrega` 
+    WHERE dt_criacao > "2025-10-01"
+    AND cod_centro = 'D014'
+    AND dt_faturamento IS NOT NULL
+    GROUP BY ALL
+),
+
+Mapa AS (
+
+SELECT
+DISTINCT(nr_final_da_tu) AS TU,
+tp_atendimento,
+FROM `sandbox-operacoes-logistica.logistica.mapa_carregamento`
+
+)
+
+SELECT
+    BaseEWM.TU,
+    BaseEWM.Remessa,
+    BaseEWM.DataCriacao,
+    BaseEWM.TipoRemessa,
+    BaseEWM.Transp,
+    Mapa.tp_atendimento,
+    Tarefas.UC,
+    Tarefas.Tp_CX_Predominante AS Tp_CX,
+    Tarefas.Min_Dt_Confirmacao,
+    Tarefas.Max_Dt_Confirmacao,
+    Peds.dt_faturamento,
+    Peds.Material,
+    Peds.Qtd,
+    Material.cod_marca_mae,
+    Peds.Qtd * Material.VolCubMat AS VolCubado,
+    Peds.Qtd * Material.qt_peso_bruto AS PesoTotalItem,
+
+    CASE
+        WHEN BaseEWM.TipoRemessa = 'ZICV' AND BaseEWM.Recebedor = 'D026' THEN 'Varejo PR'
+        WHEN BaseEWM.TipoRemessa = 'ZICV' AND BaseEWM.Recebedor = 'D018' THEN 'Varejo SC'
+        WHEN BaseEWM.Remessa = calaminho.remessa_calaminho THEN 'Varejo RS'
+        WHEN LENGTH(BaseEWM.TU) <14 THEN 'EQ' 
+        ELSE 'Regular'
+    END AS TipoAtendimento
+
+FROM BaseEWM
+
+LEFT JOIN Tarefas ON BaseEWM.Remessa = Tarefas.Remessa
+LEFT JOIN Peds ON BaseEWM.Remessa = Peds.Remessa 
+LEFT JOIN Material ON Material.cod_material = Peds.Material
+LEFT JOIN calaminho ON BaseEWM.Remessa = calaminho.remessa_calaminho
+LEFT JOIN Mapa ON RIGHT(BaseEWM.TU, 4) = Mapa.TU
+WHERE Peds.Qtd IS NOT NULL
